@@ -1,0 +1,85 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: sentinel
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinel -d sentinel"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  mlflow:
+    build: .
+    command: ["mlflow", "server", "--host", "0.0.0.0", "--port", "5000", "--backend-store-uri", "file:/mlflow/mlruns", "--artifacts-destination", "/mlflow/artifacts"]
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow_data:/mlflow
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health', timeout=3)"]
+      interval: 10s
+      timeout: 4s
+      retries: 15
+
+  api:
+    build: .
+    command: ["sh", "-c", "alembic upgrade head && uvicorn sentinel_ai.api.main:app --host 0.0.0.0 --port 8000"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://sentinel:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/sentinel
+      MODEL_PATH: /app/artifacts/model.joblib
+      MODEL_METADATA_PATH: /app/artifacts/model_metadata.json
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./artifacts:/app/artifacts:ro
+      - ./data:/app/data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 4s
+      retries: 10
+
+  trainer:
+    build: .
+    profiles: ["training"]
+    command: ["python", "-m", "sentinel_ai.models.train"]
+    environment:
+      MODEL_PATH: /app/artifacts/model.joblib
+      MODEL_METADATA_PATH: /app/artifacts/model_metadata.json
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      DATA_PATH: /app/data/raw/PS_20174392719_1491204439457_log.csv
+      SAMPLE_FRACTION: ${SAMPLE_FRACTION:-0.1}
+      RANDOM_SEED: ${RANDOM_SEED:-42}
+      MIN_PRECISION: ${MIN_PRECISION:-0.5}
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./data:/app/data:ro
+      - ./reports:/app/reports
+    depends_on:
+      mlflow:
+        condition: service_healthy
+
+  dashboard:
+    build: .
+    command: ["streamlit", "run", "app/dashboard/Home.py", "--server.address=0.0.0.0", "--server.port=8501"]
+    environment:
+      API_URL: http://api:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      api:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  mlflow_data:
